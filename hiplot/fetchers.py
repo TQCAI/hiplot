@@ -13,7 +13,7 @@ import glob
 import os
 import importlib
 import importlib.util
-from typing import Dict, List, Optional, Callable, Any
+from typing import Dict, List, Optional, Callable, Any, Set
 from pathlib import Path
 
 from . import experiment as hip
@@ -84,7 +84,6 @@ def load_json(uri: str) -> hip.Experiment:
 
 
 def load_fairseq(uri: str) -> hip.Experiment:
-    # pylint:disable=too-many-locals
     PREFIX = 'fairseq://'
     if not uri.startswith(PREFIX):
         raise hip.ExperimentFetcherDoesntApply()
@@ -101,11 +100,16 @@ def load_fairseq(uri: str) -> hip.Experiment:
                 break
         if not found:
             raise hip.ExperimentFetcherDoesntApply("No log file found")
-    lines = train_log.read_text(encoding="utf-8").split('\n')
+    return load_fairseq_from_log(train_log.read_text(encoding="utf-8"))
 
+
+def load_fairseq_from_log(text: str) -> hip.Experiment:
+    # pylint:disable=too-many-locals
+    lines = text.split('\n')
     datapoints: List[Dict[str, Any]] = []
     params: Dict[str, Any] = {}
     logs_prefix_re = r"(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2} \| [A-Z]* \| )"
+    seen_valid_ds: Set[str] = set()
     for l in lines:
         # Strip log prefix
         # eg "2020-03-08 16:48:16 | INFO | "
@@ -124,12 +128,20 @@ def load_fairseq(uri: str) -> hip.Experiment:
                 for kw in node.body[0].value.keywords  # type: ignore
             }
             continue
-        # Results in JSON format
+        # Results in JSON format - we might have several ones
         # valid | {"epoch": 33, "valid_loss": "0.723", "valid_ppl": "1.65", ...}
-        if l.startswith("valid | {"):
-            json_string = l.split('|', 1)[-1].lstrip()
+        # test | {"epoch": 33, "test_loss": "0.723", "test_ppl": "1.65", ...}
+        l_parts = l.split(' | ')
+        if len(l_parts) >= 2 and l_parts[1].startswith('{"') and l_parts[0] != "train":
+            ds = l_parts[0]
+            json_string = l_parts[1]
             valid_metrics = json.loads(json_string)
-            datapoints.append(valid_metrics)
+            if datapoints and ds not in seen_valid_ds:
+                datapoints[-1].update(valid_metrics)
+                seen_valid_ds.add(ds)
+            else:
+                datapoints.append(valid_metrics)
+                seen_valid_ds = set([ds])
         # For older version of fairseq
         if l.startswith('| epoch'):
             l = l.lstrip('| epoch')
